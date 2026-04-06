@@ -26,6 +26,7 @@
 - 설계 단계에서 단기 구현 편의뿐 아니라 장기 유지비, 중복 여부, 의존성, 롤백 경로를 함께 검토한다.
 - UI(LWC/Aura/VF)가 비즈니스 규칙을 직접 품거나 플랫폼 order of execution을 우회하는 구현을 지양한다.
 - 수용한 기술부채는 `docs/technical-debt/register.md`와 `docs/technical-debt/items/TD-xxx.md`에 기록하고, 비즈니스 영향과 상환 계획을 남긴다.
+- 고객사 확인 대기, 변경 가능성 높은 요구사항, 가정 기반 구현은 `pending-confirm` 유형으로 선등록하고 코드에 `// TD-xxx` 주석으로 추적한다.
 
 ## 실패 관리 연계
 
