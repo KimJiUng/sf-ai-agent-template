@@ -1,0 +1,7 @@
+# Salesforce
+.sfdx
+.sf
+.localdevserver
+
+# Dependencies
+node_modules

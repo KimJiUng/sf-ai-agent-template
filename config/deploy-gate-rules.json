@@ -1,0 +1,34 @@
+{
+  "required_files": [
+    "CLAUDE.md",
+    "docs/architecture.md",
+    "docs/deploy-gate-가이드.md",
+    "docs/orchestration-가이드.md",
+    "docs/design/README.md",
+    "docs/design/design-artifacts.md",
+    "docs/requirements/README.md",
+    "scripts/deploy-gate-check.ps1",
+    "scripts/deploy-with-gate.ps1"
+  ],
+  "banned_patterns": [
+    {
+      "name": "no-figma-reference",
+      "pattern": "(?i)figma",
+      "include_extensions": [".md", ".yml"],
+      "message": "외부 Figma 참조는 금지되어 있습니다. 저장소 내 디자인 명세 경로를 사용하세요."
+    }
+  ],
+  "text_contract_rules": {
+    "CLAUDE.md": {
+      "must_contain": [
+        "하네스 방식",
+        "영속 컨텍스트",
+        "Deploy Gate"
+      ]
+    }
+  },
+  "design_artifact_index": {
+    "path": "docs/design/design-artifacts.md",
+    "must_exist_paths_prefixes": ["docs/design/"]
+  }
+}
