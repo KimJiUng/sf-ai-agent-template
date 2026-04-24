@@ -10,11 +10,17 @@
     "test:unit:watch": "sfdx-lwc-jest --watch",
     "test:unit:debug": "sfdx-lwc-jest --debug",
     "test:unit:coverage": "sfdx-lwc-jest --coverage",
+    "test:scripts": "node scripts/run_deploy_gate.js test-scripts",
     "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
     "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-    "deploy-gate:check": "powershell -ExecutionPolicy Bypass -File scripts/deploy-gate-check.ps1",
-    "deploy:safe": "powershell -ExecutionPolicy Bypass -File scripts/deploy-with-gate.ps1",
-    "precommit": "lint-staged"
+    "work:snapshot": "node scripts/run_deploy_gate.js snapshot",
+    "debt:scan": "node scripts/run_deploy_gate.js debt-scan",
+    "deploy-gate:check": "node scripts/run_deploy_gate.js check",
+    "deploy-gate:check:ps": "powershell -ExecutionPolicy Bypass -File scripts/deploy-gate-check.ps1",
+    "deploy-gate:check:sh": "bash scripts/deploy-gate-check.sh",
+    "deploy:safe": "node scripts/run_deploy_gate.js deploy",
+    "deploy:safe:ps": "powershell -ExecutionPolicy Bypass -File scripts/deploy-with-gate.ps1",
+    "deploy:safe:sh": "bash scripts/deploy-with-gate.sh"
   },
   "devDependencies": {
     "@lwc/eslint-plugin-lwc": "^3.1.0",
@@ -26,19 +32,7 @@
     "eslint": "^9.29.0",
     "eslint-plugin-import": "^2.31.0",
     "eslint-plugin-jest": "^28.14.0",
-    "lint-staged": "^16.1.2",
     "prettier": "^3.5.3",
     "prettier-plugin-apex": "^2.2.6"
-  },
-  "lint-staged": {
-    "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
-      "prettier --write"
-    ],
-    "**/{aura,lwc}/**/*.js": [
-      "eslint"
-    ],
-    "**/lwc/**": [
-      "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
-    ]
   }
 }

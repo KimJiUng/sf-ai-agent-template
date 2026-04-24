@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 
+IGNORED_DIRS = {".git", ".sfdx", ".sf", "node_modules", "backups"}
+
+
 class Violation(NamedTuple):
     rule: str
     path: str
@@ -43,9 +46,9 @@ def check_banned_patterns(root: Path, config: dict) -> list[Violation]:
         pattern = re.compile(rule["pattern"])
 
         for dirpath, _, filenames in os.walk(root):
-            # .git, node_modules 등 무시
+            # local tool/runtime directories are ignored
             rel_dir = os.path.relpath(dirpath, root)
-            if any(part.startswith(".") or part == "node_modules" for part in Path(rel_dir).parts):
+            if any(part in IGNORED_DIRS for part in Path(rel_dir).parts):
                 continue
 
             for filename in filenames:
@@ -79,7 +82,7 @@ def check_markdown_links(root: Path) -> list[Violation]:
 
     for dirpath, _, filenames in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root)
-        if any(part.startswith(".") or part == "node_modules" for part in Path(rel_dir).parts):
+        if any(part in IGNORED_DIRS for part in Path(rel_dir).parts):
             continue
 
         for filename in filenames:
@@ -119,7 +122,7 @@ def check_markdown_encoding(root: Path) -> list[Violation]:
     violations = []
     for dirpath, _, filenames in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root)
-        if any(part.startswith(".") or part == "node_modules" for part in Path(rel_dir).parts):
+        if any(part in IGNORED_DIRS for part in Path(rel_dir).parts):
             continue
 
         for filename in filenames:

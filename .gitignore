@@ -45,3 +45,6 @@ docs/requirements/local-docs/
 # Local tool artifacts
 output/
 tmp/
+backups/
+__pycache__/
+*.pyc

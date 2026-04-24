@@ -1,5 +1,6 @@
 {
   "required_files": [
+    "AGENTS.md",
     "CLAUDE.md",
     "docs/architecture.md",
     "docs/coding-standards.md",
@@ -8,8 +9,15 @@
     "docs/design/README.md",
     "docs/design/design-artifacts.md",
     "docs/requirements/README.md",
+    "scripts/run_deploy_gate.js",
+    "scripts/deploy_gate_check.py",
+    "scripts/deploy_org_check.py",
+    "scripts/debt_scan.py",
+    "scripts/work_snapshot.py",
     "scripts/deploy-gate-check.ps1",
-    "scripts/deploy-with-gate.ps1"
+    "scripts/deploy-with-gate.ps1",
+    "scripts/deploy-gate-check.sh",
+    "scripts/deploy-with-gate.sh"
   ],
   "banned_patterns": [
     {
@@ -20,6 +28,13 @@
     }
   ],
   "text_contract_rules": {
+    "AGENTS.md": {
+      "must_contain": [
+        "하네스 방식",
+        "영속 컨텍스트",
+        "Deploy Gate"
+      ]
+    },
     "CLAUDE.md": {
       "must_contain": [
         "하네스 방식",

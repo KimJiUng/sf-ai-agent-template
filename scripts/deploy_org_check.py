@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
-Org-aware 배포 전 검사
+Org-aware pre-deploy check without repository-history dependency.
 
-1. UTF-8 인코딩 검사
-2. 한글 깨짐 검사
-3. Org 현재본 retrieve → git base ref 3-way 비교
-   - 로컬만 변경: 그대로 배포
-   - Org만 변경: org 버전으로 로컬 갱신 (배포 시 덮어쓰기 방지)
-   - 양쪽 변경: git merge-file 자동 병합 → 실패 시 배포 중단
+The workflow uses a work snapshot created before AI changes:
+
+1. local-backup: local files before the AI edits them
+2. org-start: the target org version at the same moment
+
+Before deployment this script retrieves the current org version and performs a
+3-way comparison:
+
+    org-start + current local + current org
+
+Non-overlapping changes are merged automatically. Overlapping changes stop the
+deployment and must be reviewed by a human.
 """
+from __future__ import annotations
+
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -51,41 +61,18 @@ METADATA_TYPE_MAP = {
 BUNDLE_TYPES = {"lwc", "aura"}
 
 
-# ──────────────────────────────────────────────
-# Git helpers
-# ──────────────────────────────────────────────
-
-def get_base_ref(root: Path) -> str | None:
-    for ref in ["origin/HEAD", "origin/master", "origin/main"]:
-        r = subprocess.run(
-            ["git", "rev-parse", "--verify", ref],
-            capture_output=True, text=True, cwd=root,
-        )
-        if r.returncode == 0:
-            return ref
-    r = subprocess.run(
-        ["git", "rev-parse", "--verify", "HEAD~1"],
-        capture_output=True, text=True, cwd=root,
-    )
-    return "HEAD~1" if r.returncode == 0 else None
+@dataclass(frozen=True)
+class Change:
+    start: int
+    end: int
+    replacement: list[str]
 
 
-def get_changed_files(base_ref: str, root: Path) -> list[str]:
-    r = subprocess.run(
-        ["git", "diff", "--name-only", base_ref, "--", "force-app/"],
-        capture_output=True, text=True, cwd=root,
-    )
-    if r.returncode != 0:
-        return []
-    return [f for f in r.stdout.strip().split("\n") if f]
-
-
-def git_show(root: Path, ref: str, rel_path: str) -> str | None:
-    r = subprocess.run(
-        ["git", "show", f"{ref}:{rel_path}"],
-        capture_output=True, text=True, cwd=root,
-    )
-    return r.stdout if r.returncode == 0 else None
+@dataclass(frozen=True)
+class MergeResult:
+    success: bool
+    content: str
+    conflicts: list[str]
 
 
 # ──────────────────────────────────────────────
@@ -93,7 +80,7 @@ def git_show(root: Path, ref: str, rel_path: str) -> str | None:
 # ──────────────────────────────────────────────
 
 def file_to_metadata(rel_path: str) -> str | None:
-    """force-app 경로 → Metadata API type:name"""
+    """Convert a force-app source path to Metadata API type:name."""
     parts = Path(rel_path).parts
     if len(parts) < 5 or parts[0] != "force-app":
         return None
@@ -117,8 +104,114 @@ def get_api_version(root: Path) -> str:
     return "65.0"
 
 
+def retrieve_from_org(
+    root: Path, target_org: str, metadata_items: set[str],
+) -> tuple[Path | None, bool]:
+    """Retrieve metadata from the org into a temporary Salesforce project."""
+    temp_dir = Path(tempfile.mkdtemp(prefix="org-retrieve-"))
+    try:
+        (temp_dir / "force-app" / "main" / "default").mkdir(parents=True)
+        sfdx_cfg = {
+            "packageDirectories": [{"path": "force-app", "default": True}],
+            "sourceApiVersion": get_api_version(root),
+        }
+        with open(temp_dir / "sfdx-project.json", "w", encoding="utf-8") as f:
+            json.dump(sfdx_cfg, f)
+
+        cmd = ["sf", "project", "retrieve", "start", "--target-org", target_org]
+        for item in sorted(metadata_items):
+            cmd.extend(["--metadata", item])
+
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_dir)
+        if result.returncode != 0:
+            print(f"{YELLOW}  Org retrieve warning: {result.stderr.strip()}{NC}")
+            return temp_dir, False
+        return temp_dir, True
+    except FileNotFoundError:
+        print(f"{YELLOW}  sf CLI not found. Skipping org comparison.{NC}")
+        return temp_dir, False
+
+
 # ──────────────────────────────────────────────
-# Encoding checks (기존)
+# Work snapshot helpers
+# ──────────────────────────────────────────────
+
+def parse_runtime_args(args: list[str]) -> tuple[str | None, list[str]]:
+    session_dir: str | None = None
+    deploy_args: list[str] = []
+    i = 0
+    while i < len(args):
+        value = args[i]
+        if value == "--session-dir":
+            session_dir = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if value.startswith("--session-dir="):
+            session_dir = value.split("=", 1)[1]
+            i += 1
+            continue
+        deploy_args.append(value)
+        i += 1
+    return session_dir, deploy_args
+
+
+def load_session(root: Path, requested: str | None) -> tuple[Path, dict]:
+    if requested:
+        session_dir = Path(requested)
+        if not session_dir.is_absolute():
+            session_dir = (root / session_dir).resolve()
+    else:
+        latest = root / "backups" / "latest-session.json"
+        if not latest.exists():
+            raise FileNotFoundError(
+                "Work snapshot is missing. Run `npm run work:snapshot -- "
+                "--target-org <ORG_ALIAS> --files <paths...>` before deployment."
+            )
+        pointer = json.loads(latest.read_text(encoding="utf-8"))
+        session_dir = (root / pointer["session_dir"]).resolve()
+
+    manifest_path = session_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Work snapshot manifest is missing: {manifest_path}")
+
+    return session_dir, json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def get_tracked_files(manifest: dict) -> list[str]:
+    return sorted({f.replace("\\", "/") for f in manifest.get("files", []) if f})
+
+
+def read_optional_text(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def get_changed_files_from_snapshot(root: Path, session_dir: Path, manifest: dict) -> list[str]:
+    changed: list[str] = []
+    backup_root = session_dir / "local-backup"
+    for rel in get_tracked_files(manifest):
+        local_path = root / rel
+        backup_path = backup_root / rel
+        local_exists = local_path.exists()
+        backup_exists = backup_path.exists()
+        if local_exists != backup_exists:
+            changed.append(rel)
+            continue
+        if not local_exists:
+            continue
+        if local_path.suffix.lower() not in TEXT_EXTENSIONS:
+            continue
+        try:
+            if local_path.read_text(encoding="utf-8") != backup_path.read_text(encoding="utf-8"):
+                changed.append(rel)
+        except (UnicodeDecodeError, OSError):
+            changed.append(rel)
+    return changed
+
+
+# ──────────────────────────────────────────────
+# Encoding checks
 # ──────────────────────────────────────────────
 
 def check_utf8_encoding(root: Path, files: list[str]) -> list[str]:
@@ -152,162 +245,178 @@ def check_korean_corruption(root: Path, files: list[str]) -> list[str]:
 
 
 # ──────────────────────────────────────────────
-# Org retrieve
+# 3-way merge without repository-history dependency
 # ──────────────────────────────────────────────
 
-def retrieve_from_org(
-    root: Path, target_org: str, metadata_items: set[str],
-) -> tuple[Path | None, bool]:
-    """Org에서 메타데이터를 임시 프로젝트로 retrieve. (temp_dir, success)"""
-    temp_dir = Path(tempfile.mkdtemp(prefix="org-retrieve-"))
-    try:
-        (temp_dir / "force-app" / "main" / "default").mkdir(parents=True)
-        sfdx_cfg = {
-            "packageDirectories": [{"path": "force-app", "default": True}],
-            "sourceApiVersion": get_api_version(root),
-        }
-        with open(temp_dir / "sfdx-project.json", "w", encoding="utf-8") as f:
-            json.dump(sfdx_cfg, f)
+def _changes(base: list[str], changed: list[str]) -> list[Change]:
+    matcher = SequenceMatcher(None, base, changed, autojunk=False)
+    changes: list[Change] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changes.append(Change(i1, i2, changed[j1:j2]))
+    return changes
 
-        cmd = ["sf", "project", "retrieve", "start", "--target-org", target_org]
-        for m in sorted(metadata_items):
-            cmd.extend(["--metadata", m])
 
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_dir)
-        if r.returncode != 0:
-            print(f"{YELLOW}  Org retrieve warning: {r.stderr.strip()}{NC}")
-            return temp_dir, False
-        return temp_dir, True
-    except FileNotFoundError:
-        print(f"{YELLOW}  sf CLI not found. Skipping org comparison.{NC}")
-        return temp_dir, False
+def _overlaps(left: Change, right: Change) -> bool:
+    if left.start == left.end and right.start == right.end:
+        return left.start == right.start
+    if left.start == left.end:
+        return right.start <= left.start < right.end
+    if right.start == right.end:
+        return left.start <= right.start < left.end
+    return left.start < right.end and right.start < left.end
+
+
+def _apply_changes(base: list[str], changes: list[Change]) -> list[str]:
+    merged = list(base)
+    for change in sorted(changes, key=lambda item: (item.start, item.end), reverse=True):
+        merged[change.start:change.end] = change.replacement
+    return merged
+
+
+def merge_non_overlapping_changes(base: str, local: str, org: str) -> MergeResult:
+    """Merge local and org changes when their edits touch different base ranges."""
+    if local == org:
+        return MergeResult(True, local, [])
+    if base == org:
+        return MergeResult(True, local, [])
+    if base == local:
+        return MergeResult(True, org, [])
+
+    base_lines = base.splitlines(keepends=True)
+    local_lines = local.splitlines(keepends=True)
+    org_lines = org.splitlines(keepends=True)
+
+    local_changes = _changes(base_lines, local_lines)
+    org_changes = _changes(base_lines, org_lines)
+    conflicts: list[str] = []
+
+    for local_change in local_changes:
+        for org_change in org_changes:
+            if _overlaps(local_change, org_change):
+                conflicts.append(
+                    f"base lines {local_change.start + 1}-{max(local_change.end, local_change.start + 1)}"
+                )
+
+    if conflicts:
+        return MergeResult(False, local, conflicts)
+
+    merged_lines = _apply_changes(base_lines, local_changes + org_changes)
+    return MergeResult(True, "".join(merged_lines), [])
 
 
 # ──────────────────────────────────────────────
-# 3-way merge
-# ──────────────────────────────────────────────
-
-def try_merge(
-    root: Path, base: str, local: str, org: str,
-) -> dict:
-    """git merge-file -p 로 3-way 병합 시도."""
-    tmp = Path(tempfile.mkdtemp(prefix="merge-"))
-    try:
-        (tmp / "base").write_text(base, encoding="utf-8")
-        (tmp / "local").write_text(local, encoding="utf-8")
-        (tmp / "org").write_text(org, encoding="utf-8")
-
-        r = subprocess.run(
-            ["git", "merge-file", "-p",
-             str(tmp / "local"), str(tmp / "base"), str(tmp / "org")],
-            capture_output=True, text=True, cwd=root,
-        )
-        return {
-            "success": r.returncode == 0,
-            "content": r.stdout,
-            "conflicts": max(0, r.returncode),
-        }
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-# ──────────────────────────────────────────────
-# 3-way comparison (핵심)
+# 3-way comparison
 # ──────────────────────────────────────────────
 
 def do_three_way_check(
-    root: Path, target_org: str, changed_files: list[str], base_ref: str,
+    root: Path, target_org: str, session_dir: Path, manifest: dict,
 ) -> tuple[list[str], list[str]]:
-    """
-    Returns (violations, summaries).
-    violations → 비어 있지 않으면 배포 중단.
-    summaries  → 사용자 안내 메시지.
-    """
-    metadata_items: set[str] = set()
-    for f in changed_files:
-        m = file_to_metadata(f)
-        if m:
-            metadata_items.add(m)
+    changed_files = get_changed_files_from_snapshot(root, session_dir, manifest)
+    metadata_items = {file_to_metadata(f) for f in get_tracked_files(manifest)}
+    metadata_items = {item for item in metadata_items if item}
 
     if not metadata_items:
-        return [], []
+        return [], [f"{GREEN}No deployable metadata items found in work snapshot.{NC}"]
 
     print(f"{CYAN}Retrieving {len(metadata_items)} metadata item(s) from org [{target_org}]...{NC}")
-    temp_dir, ok = retrieve_from_org(root, target_org, metadata_items)
+    current_org_dir, ok = retrieve_from_org(root, target_org, metadata_items)
     if not ok:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        return [], [f"{YELLOW}  Org retrieve 실패 — 3-way 비교를 건너뜁니다.{NC}"]
+        if current_org_dir:
+            shutil.rmtree(current_org_dir, ignore_errors=True)
+        return [f"{YELLOW}[Rule] org-retrieve{NC}", "  - Could not retrieve current org metadata."], []
 
     violations: list[str] = []
     summaries: list[str] = []
-    org_only_files: list[str] = []
-    merged_files: list[str] = []
+    auto_merged: list[str] = []
+    org_only_updates: list[str] = []
+    deleted_files: list[str] = []
+    created_files: list[str] = []
+
+    org_start_root = session_dir / "org-start"
+    local_backup_root = session_dir / "local-backup"
 
     try:
-        for f in changed_files:
-            local_path = root / f
+        for rel in get_tracked_files(manifest):
+            local_path = root / rel
+            local_backup_path = local_backup_root / rel
+            base_path = org_start_root / rel
+            current_org_path = current_org_dir / rel
+
             if not local_path.exists():
+                if local_backup_path.exists():
+                    deleted_files.append(rel)
+                    violations.append(
+                        f"  - {rel}: 삭제 감지. destructive 배포는 자동 처리하지 않습니다."
+                    )
                 continue
+
             if local_path.suffix.lower() not in TEXT_EXTENSIONS:
                 continue
 
-            try:
-                local_content = local_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue
-
-            base_content = git_show(root, base_ref, f)
-            org_path = temp_dir / f
-            if not org_path.exists():
-                continue
-            try:
-                org_content = org_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue
+            local_content = read_optional_text(local_path)
+            base_content = read_optional_text(base_path)
+            current_org_content = read_optional_text(current_org_path)
+            local_backup_content = read_optional_text(local_backup_path)
 
             if base_content is None:
+                if current_org_content is None:
+                    created_files.append(rel)
+                    continue
+                violations.append(
+                    f"  - {rel}: 로컬 신규 파일이지만 현재 Org에도 같은 메타데이터가 있습니다."
+                )
                 continue
 
-            local_changed = base_content != local_content
-            org_changed = base_content != org_content
-
-            if not org_changed:
+            if current_org_content is None:
+                violations.append(
+                    f"  - {rel}: 작업 시작 후 Org에서 메타데이터가 삭제되었습니다."
+                )
                 continue
 
-            if not local_changed:
-                local_path.write_text(org_content, encoding="utf-8")
-                org_only_files.append(f)
+            if local_content == local_backup_content and current_org_content != base_content:
+                local_path.write_text(current_org_content, encoding="utf-8")
+                org_only_updates.append(rel)
                 continue
 
-            merge = try_merge(root, base_content, local_content, org_content)
-            if merge["success"]:
-                local_path.write_text(merge["content"], encoding="utf-8")
-                merged_files.append(f)
+            merge = merge_non_overlapping_changes(base_content, local_content, current_org_content)
+            if merge.success:
+                if merge.content != local_content:
+                    local_path.write_text(merge.content, encoding="utf-8")
+                    auto_merged.append(rel)
             else:
                 violations.append(
-                    f"  - {f}: 로컬과 Org 양쪽에서 같은 영역 수정 — "
-                    f"충돌 {merge['conflicts']}건"
+                    f"  - {rel}: 로컬과 Org 변경 의도가 겹칩니다. "
+                    f"충돌 위치: {', '.join(merge.conflicts)}"
                 )
 
-        if org_only_files:
-            summaries.append(
-                f"{CYAN}  [org-only] {len(org_only_files)}개 파일: "
-                f"Org 버전으로 갱신 (로컬 미변경){NC}"
-            )
-            for f in org_only_files:
-                summaries.append(f"    → {f}")
+        if changed_files:
+            summaries.append(f"{CYAN}  [local-change] {len(changed_files)}개 파일 변경 감지{NC}")
+            for rel in changed_files:
+                summaries.append(f"    -> {rel}")
 
-        if merged_files:
-            summaries.append(
-                f"{GREEN}  [auto-merge] {len(merged_files)}개 파일: "
-                f"로컬+Org 변경사항 자동 병합 완료{NC}"
-            )
-            for f in merged_files:
-                summaries.append(f"    → {f}")
+        if created_files:
+            summaries.append(f"{GREEN}  [created] {len(created_files)}개 파일 신규 생성{NC}")
+            for rel in created_files:
+                summaries.append(f"    -> {rel}")
 
+        if org_only_updates:
+            summaries.append(f"{CYAN}  [org-only] {len(org_only_updates)}개 파일을 Org 최신본으로 갱신{NC}")
+            for rel in org_only_updates:
+                summaries.append(f"    -> {rel}")
+
+        if auto_merged:
+            summaries.append(f"{GREEN}  [auto-merge] {len(auto_merged)}개 파일 자동 병합 완료{NC}")
+            for rel in auto_merged:
+                summaries.append(f"    -> {rel}")
+
+        if deleted_files:
+            summaries.append(f"{YELLOW}  [deleted] {len(deleted_files)}개 파일 삭제 감지{NC}")
+            for rel in deleted_files:
+                summaries.append(f"    -> {rel}")
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(current_org_dir, ignore_errors=True)
 
     return violations, summaries
 
@@ -316,54 +425,59 @@ def do_three_way_check(
 # Main
 # ──────────────────────────────────────────────
 
-def main():
+def main() -> None:
     if len(sys.argv) < 3:
-        print(f"{RED}Usage: {sys.argv[0]} <ROOT_PATH> <TARGET_ORG> [deploy args...]{NC}")
+        print(f"{RED}Usage: {sys.argv[0]} <ROOT_PATH> <TARGET_ORG> [--session-dir <DIR>] [deploy args...]{NC}")
         sys.exit(2)
 
     root = Path(sys.argv[1]).resolve()
     target_org = sys.argv[2]
+    session_arg, _deploy_args = parse_runtime_args(sys.argv[3:])
 
-    base_ref = get_base_ref(root)
-    if not base_ref:
-        print(f"{YELLOW}Git base ref를 결정할 수 없습니다. Org-aware 검사를 건너뜁니다.{NC}")
+    try:
+        session_dir, manifest = load_session(root, session_arg)
+    except (FileNotFoundError, KeyError, json.JSONDecodeError) as exc:
+        print(f"{RED}Work snapshot check failed: deployment will be stopped.{NC}")
+        print(f"  - {exc}")
+        sys.exit(2)
+
+    snapshot_org = manifest.get("target_org")
+    if snapshot_org and snapshot_org != target_org:
+        print(f"{RED}Work snapshot target org mismatch: deployment will be stopped.{NC}")
+        print(f"  - snapshot org: {snapshot_org}")
+        print(f"  - deploy org: {target_org}")
+        sys.exit(2)
+
+    tracked_files = get_tracked_files(manifest)
+    if not tracked_files:
+        print(f"{YELLOW}Work snapshot has no tracked files. Org-aware check skipped.{NC}")
         sys.exit(0)
 
-    print(f"{CYAN}Using git base ref: {base_ref}{NC}")
-
-    changed_files = get_changed_files(base_ref, root)
-    if not changed_files:
-        print(f"{GREEN}No force-app changes detected. Skipping org-aware check.{NC}")
-        sys.exit(0)
-
-    print(f"{CYAN}Checking {len(changed_files)} changed file(s)...{NC}")
+    print(f"{CYAN}Using work snapshot: {session_dir}{NC}")
+    print(f"{CYAN}Checking {len(tracked_files)} tracked file(s)...{NC}")
 
     all_violations: list[str] = []
 
-    # ── 1. UTF-8 인코딩 검사 ──
-    utf8 = check_utf8_encoding(root, changed_files)
+    utf8 = check_utf8_encoding(root, tracked_files)
     if utf8:
         all_violations.append(f"{YELLOW}[Rule] encoding-check{NC}")
         all_violations.extend(utf8)
 
-    # ── 2. 한글 깨짐 검사 ──
-    korean = check_korean_corruption(root, changed_files)
+    korean = check_korean_corruption(root, tracked_files)
     if korean:
         all_violations.append(f"{YELLOW}[Rule] korean-corruption{NC}")
         all_violations.extend(korean)
 
-    # ── 3. 3-way 비교 (Org retrieve → compare → merge) ──
     three_way_violations, three_way_summaries = do_three_way_check(
-        root, target_org, changed_files, base_ref,
+        root, target_org, session_dir, manifest,
     )
     if three_way_violations:
         all_violations.append(f"{YELLOW}[Rule] org-conflict{NC}")
         all_violations.extend(three_way_violations)
 
-    for s in three_way_summaries:
-        print(s)
+    for summary in three_way_summaries:
+        print(summary)
 
-    # ── 결과 ──
     if all_violations:
         print()
         print(f"{RED}Org-aware pre-deploy check failed: deployment will be stopped.{NC}")

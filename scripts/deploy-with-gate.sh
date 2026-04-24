@@ -17,6 +17,23 @@ NC='\033[0m'
 TARGET_ORG="${1:-}"
 shift 2>/dev/null || true
 DEPLOY_ARGS=("$@")
+SF_DEPLOY_ARGS=()
+
+skip_next=false
+for arg in "${DEPLOY_ARGS[@]}"; do
+    if [[ "$skip_next" == true ]]; then
+        skip_next=false
+        continue
+    fi
+    if [[ "$arg" == "--session-dir" ]]; then
+        skip_next=true
+        continue
+    fi
+    if [[ "$arg" == --session-dir=* ]]; then
+        continue
+    fi
+    SF_DEPLOY_ARGS+=("$arg")
+done
 
 if [[ -z "$TARGET_ORG" ]]; then
     echo -e "${RED}Usage: $0 <ORG_ALIAS> [additional sf deploy args...]${NC}"
@@ -51,5 +68,5 @@ if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
     export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 fi
 
-sf project deploy start --target-org "$TARGET_ORG" "${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}"
+sf project deploy start --target-org "$TARGET_ORG" "${SF_DEPLOY_ARGS[@]+"${SF_DEPLOY_ARGS[@]}"}"
 exit $?

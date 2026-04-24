@@ -18,15 +18,19 @@
 - Salesforce 보안 규칙(CRUD/FLS) 준수
 - Bulkify 기준 준수 (Trigger/Service)
 - 테스트 전략: LWC 단위 테스트 + Apex 테스트
+- 작업 전 로컬 백업 및 Org snapshot 생성
 - 배포 전 Deploy Gate 필수 통과
+- 사용자 승인 전 Org 배포 금지
 
 ## 기술부채 관리 원칙
 
 - 표준 기능 우선 원칙을 적용한다. built-in platform service를 먼저 검토하고, 필요 시 패키지 또는 low-code를 거친 뒤 마지막에 custom code를 선택한다.
 - 설계 단계에서 단기 구현 편의뿐 아니라 장기 유지비, 중복 여부, 의존성, 롤백 경로를 함께 검토한다.
 - UI(LWC/Aura/VF)가 비즈니스 규칙을 직접 품거나 플랫폼 order of execution을 우회하는 구현을 지양한다.
-- 수용한 기술부채는 `docs/technical-debt/register.md`와 `docs/technical-debt/items/TD-xxx.md`에 기록하고, 비즈니스 영향과 상환 계획을 남긴다.
-- 고객사 확인 대기, 변경 가능성 높은 요구사항, 가정 기반 구현은 `pending-confirm` 유형으로 선등록하고 코드에 `// TD-xxx` 주석으로 추적한다.
+- 고객사 확인 대기, 변경 가능성 높은 요구사항, 가정 기반 구현은 `review-needed` 상태로 선등록한다.
+- 배포 전 Review Gate가 수정된 파일을 스캔하여 기술부채 후보를 `docs/technical-debt/register.md`에 자동 누적한다.
+- 자동 수집된 후보는 사람이 확인한 뒤 `accepted`, `resolved`, `skipped`로 정리한다.
+- 상세 분석이 필요한 확정 부채만 `docs/technical-debt/items/TD-xxx.md`에 별도 기록한다.
 
 ## 실패 관리 연계
 

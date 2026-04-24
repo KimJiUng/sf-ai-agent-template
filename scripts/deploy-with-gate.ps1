@@ -22,6 +22,21 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootPath  = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 
+$SfDeployArgs = @()
+for ($i = 0; $i -lt $DeployArgs.Count; $i++) {
+    $arg = $DeployArgs[$i]
+    if ($arg -eq "--session-dir") {
+        $i++
+        continue
+    }
+    if ($arg -like "--session-dir=*") {
+        continue
+    }
+    if ($arg) {
+        $SfDeployArgs += $arg
+    }
+}
+
 # --- 1단계: 정적 Deploy Gate ---
 Write-Host "Running Deploy Gate pre-deploy validation..." -ForegroundColor Cyan
 & powershell -ExecutionPolicy Bypass -File "$ScriptDir\deploy-gate-check.ps1" -RootPath $RootPath
@@ -41,6 +56,6 @@ if ($LASTEXITCODE -ne 0) {
 
 # --- 3단계: Salesforce 배포 ---
 Write-Host "All checks passed. Starting Salesforce deployment..." -ForegroundColor Green
-$sfArgs = @("project", "deploy", "start", "--target-org", $TargetOrg) + ($DeployArgs | Where-Object { $_ })
+$sfArgs = @("project", "deploy", "start", "--target-org", $TargetOrg) + $SfDeployArgs
 & sf @sfArgs
 exit $LASTEXITCODE
